@@ -1,0 +1,18 @@
+# Core dependencies for GeoJSON merger
+pyspark>=3.4.0
+transforms-api>=1.0.0
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-spark>=0.6.0
+pytest-cov>=4.0.0
+
+# Development dependencies
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+
+# Optional: For local development without Foundry
+# These are mock implementations for testing
+mock>=5.0.0
+freezegun>=1.2.0
