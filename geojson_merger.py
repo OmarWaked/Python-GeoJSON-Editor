@@ -16,12 +16,12 @@ def merge_geojson_with_table(geojson_input, table_input, output_geojson):
     This version handles GeoJSON stored as an unstructured dataset with proper error handling.
     """
     
-    # Get Spark context
-    spark = geojson_input.spark_session
-    
     try:
-        # Step 1: Read the GeoJSON dataset
+        # Step 1: Read the GeoJSON dataset and get Spark session
         geojson_df = geojson_input.dataframe()
+        
+        # Get Spark session from the dataframe
+        spark = geojson_df.sparkSession
         
         # Check if the dataframe has content
         if geojson_df.count() == 0:
