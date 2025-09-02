@@ -1,248 +1,363 @@
-from transforms.api import transform, Input, Output
+from transforms.api import transform, Input, Output, FileInput
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType
 import json
 
 
 @transform(
-    geojson_input=Input("/path/to/your/geojson/dataset"),  # Update with your GeoJSON dataset path
-    table_input=Input("/path/to/your/table/dataset"),      # Update with your table dataset path
-    output_geojson=Output("/path/to/output/geojson/dataset")  # Update with your output path
+    # Replace these with your actual RIDs
+    geojson_input=Input("ri.foundry.main.dataset.your-geojson-rid-here"),
+    table_input=Input("ri.foundry.main.dataset.your-table-rid-here"),
+    output_geojson=Output("ri.foundry.main.dataset.your-output-rid-here")
 )
 def merge_geojson_with_table(geojson_input, table_input, output_geojson):
     """
-    Merges a GeoJSON file with a regular Foundry dataset based on county names.
+    Merges a GeoJSON dataset with a regular Foundry dataset based on county names.
     
-    Args:
-        geojson_input: Input GeoJSON file (unstructured)
-        table_input: Input table dataset with county information
-        output_geojson: Output merged GeoJSON file
+    This version handles GeoJSON stored as an unstructured dataset with proper error handling.
     """
     
     # Get Spark context
     spark = geojson_input.spark_session
     
-    # Step 1: Read the GeoJSON file as text
-    geojson_rdd = geojson_input.dataframe().rdd
-    
-    # Collect the GeoJSON content (assuming it's a single file)
-    # If multiple files, you may need to handle differently
-    geojson_content = geojson_rdd.map(lambda row: row.value).collect()
-    
-    # Parse the GeoJSON content
-    if len(geojson_content) == 1:
-        # Single file case
-        geojson_data = json.loads(geojson_content[0])
-    else:
-        # Multiple files - concatenate them
-        merged_features = []
-        for content in geojson_content:
-            data = json.loads(content)
-            if 'features' in data:
-                merged_features.extend(data['features'])
+    try:
+        # Step 1: Read the GeoJSON dataset
+        geojson_df = geojson_input.dataframe()
         
-        # Create a combined GeoJSON structure
-        geojson_data = {
-            "type": "FeatureCollection",
-            "features": merged_features
-        }
-    
-    # Step 2: Extract features and create a DataFrame from GeoJSON properties
-    features = geojson_data.get('features', [])
-    
-    # Extract properties from each feature
-    properties_list = []
-    for i, feature in enumerate(features):
-        properties = feature.get('properties', {})
-        properties['_feature_index'] = i  # Add index to maintain feature order
-        properties_list.append(properties)
-    
-    # Create DataFrame from properties
-    if properties_list:
-        geojson_df = spark.createDataFrame(properties_list)
+        # Check if the dataframe has content
+        if geojson_df.count() == 0:
+            raise ValueError("GeoJSON dataset is empty")
         
-        # Ensure COUNTY_NAME column exists and standardize it
-        if 'COUNTY_NAME' in geojson_df.columns:
-            # Standardize the county name for matching (trim spaces, uppercase)
-            geojson_df = geojson_df.withColumn(
-                'COUNTY_NAME_CLEAN', 
-                F.upper(F.trim(F.col('COUNTY_NAME')))
-            )
+        # Handle different possible schema formats for GeoJSON storage
+        if 'value' in geojson_df.columns:
+            # Unstructured format - content is in 'value' column
+            geojson_content = geojson_df.select("value").collect()
+            
+            # Parse the GeoJSON content
+            if len(geojson_content) == 1:
+                # Single file case
+                geojson_data = json.loads(geojson_content[0][0])
+            else:
+                # Multiple files - concatenate them
+                merged_features = []
+                for row in geojson_content:
+                    data = json.loads(row[0])
+                    if 'features' in data:
+                        merged_features.extend(data['features'])
+                    elif 'type' in data and data['type'] == 'Feature':
+                        # Single feature
+                        merged_features.append(data)
+                
+                # Create a combined GeoJSON structure
+                geojson_data = {
+                    "type": "FeatureCollection",
+                    "features": merged_features
+                }
+        elif 'content' in geojson_df.columns:
+            # Alternative unstructured format
+            geojson_content = geojson_df.select("content").first()[0]
+            geojson_data = json.loads(geojson_content)
         else:
-            raise ValueError("COUNTY_NAME column not found in GeoJSON properties")
-    else:
-        raise ValueError("No features found in GeoJSON file")
+            # Try to collect all content as string
+            first_row = geojson_df.first()
+            if first_row:
+                # Try to parse the first column as JSON
+                geojson_data = json.loads(str(first_row[0]))
+            else:
+                raise ValueError("Unable to parse GeoJSON content from dataset")
+        
+        # Validate GeoJSON structure
+        if 'features' not in geojson_data:
+            if 'type' in geojson_data and geojson_data['type'] == 'Feature':
+                # Single feature - wrap in FeatureCollection
+                geojson_data = {
+                    "type": "FeatureCollection",
+                    "features": [geojson_data]
+                }
+            else:
+                raise ValueError("Invalid GeoJSON structure - no features found")
+        
+        # Step 2: Extract features and create a DataFrame from GeoJSON properties
+        features = geojson_data.get('features', [])
+        
+        if not features:
+            raise ValueError("No features found in GeoJSON file")
+        
+        # Extract properties from each feature
+        properties_list = []
+        for i, feature in enumerate(features):
+            properties = feature.get('properties', {})
+            properties['_feature_index'] = i  # Add index to maintain feature order
+            properties_list.append(properties)
+        
+        # Create DataFrame from properties
+        geojson_props_df = spark.createDataFrame(properties_list)
+        
+        # Check for county name column (case-insensitive)
+        county_col_geojson = None
+        for col in geojson_props_df.columns:
+            if col.upper() in ['COUNTY_NAME', 'COUNTYNAME', 'COUNTY', 'NAME']:
+                county_col_geojson = col
+                break
+        
+        if not county_col_geojson:
+            raise ValueError(f"No county name column found in GeoJSON properties. Available columns: {geojson_props_df.columns}")
+        
+        # Standardize the county name for matching
+        geojson_props_df = geojson_props_df.withColumn(
+            'COUNTY_NAME_CLEAN', 
+            F.upper(F.trim(F.col(county_col_geojson)))
+        )
+        
+    except Exception as e:
+        raise ValueError(f"Error processing GeoJSON input: {str(e)}")
     
-    # Step 3: Prepare the table dataset for joining
-    table_df = table_input.dataframe()
-    
-    # Standardize the county column for matching
-    if 'county' in table_df.columns:
+    try:
+        # Step 3: Prepare the table dataset for joining
+        table_df = table_input.dataframe()
+        
+        # Check if table has content
+        if table_df.count() == 0:
+            raise ValueError("Table dataset is empty")
+        
+        # Find county column in table (case-insensitive)
+        county_col_table = None
+        for col in table_df.columns:
+            if col.lower() in ['county', 'county_name', 'countyname', 'name']:
+                county_col_table = col
+                break
+        
+        if not county_col_table:
+            raise ValueError(f"No county column found in table dataset. Available columns: {table_df.columns}")
+        
+        # Standardize the county column for matching
         table_df = table_df.withColumn(
             'county_clean', 
-            F.upper(F.trim(F.col('county')))
+            F.upper(F.trim(F.col(county_col_table)))
         )
-    else:
-        raise ValueError("county column not found in table dataset")
+        
+        # Get all columns from table dataset except the join columns
+        table_columns = [col for col in table_df.columns 
+                        if col not in [county_col_table, 'county_clean']]
+        
+    except Exception as e:
+        raise ValueError(f"Error processing table input: {str(e)}")
     
-    # Get all columns from table dataset except the join column
-    table_columns = [col for col in table_df.columns if col not in ['county', 'county_clean']]
-    
-    # Step 4: Perform the merge (left join to preserve all GeoJSON features)
-    merged_df = geojson_df.join(
-        table_df,
-        geojson_df.COUNTY_NAME_CLEAN == table_df.county_clean,
-        how='left'
-    )
-    
-    # Select original GeoJSON columns plus new columns from table
-    final_columns = geojson_df.columns + table_columns
-    # Remove the temporary clean columns
-    final_columns = [col for col in final_columns if col not in ['COUNTY_NAME_CLEAN', '_feature_index']]
-    
-    merged_df = merged_df.select('_feature_index', *final_columns)
-    
-    # Step 5: Convert back to GeoJSON format
-    # Collect the merged data
-    merged_properties = merged_df.collect()
-    
-    # Create a mapping of feature index to merged properties
-    properties_map = {}
-    for row in merged_properties:
-        row_dict = row.asDict()
-        feature_idx = row_dict.pop('_feature_index')
-        properties_map[feature_idx] = row_dict
-    
-    # Update the original GeoJSON features with merged properties
-    output_features = []
-    for i, feature in enumerate(features):
-        new_feature = feature.copy()
-        if i in properties_map:
+    try:
+        # Step 4: Perform the merge (left join to preserve all GeoJSON features)
+        merged_df = geojson_props_df.join(
+            table_df,
+            geojson_props_df.COUNTY_NAME_CLEAN == table_df.county_clean,
+            how='left'
+        )
+        
+        # Log join statistics
+        total_features = geojson_props_df.count()
+        matched_features = merged_df.filter(F.col('county_clean').isNotNull()).count()
+        print(f"Join statistics: {matched_features}/{total_features} features matched")
+        
+        # Select columns for final output
+        final_columns = ['_feature_index'] + \
+                       [col for col in geojson_props_df.columns 
+                        if col not in ['COUNTY_NAME_CLEAN', '_feature_index']] + \
+                       table_columns
+        
+        merged_df = merged_df.select(*final_columns)
+        
+        # Step 5: Convert back to GeoJSON format
+        # Collect the merged data
+        merged_properties = merged_df.collect()
+        
+        # Create a mapping of feature index to merged properties
+        properties_map = {}
+        for row in merged_properties:
+            row_dict = row.asDict()
+            feature_idx = row_dict.pop('_feature_index')
+            # Remove None values to keep GeoJSON clean
+            cleaned_dict = {k: v for k, v in row_dict.items() if v is not None}
+            properties_map[feature_idx] = cleaned_dict
+        
+        # Update the original GeoJSON features with merged properties
+        output_features = []
+        for i, feature in enumerate(features):
+            new_feature = {
+                "type": feature.get("type", "Feature"),
+                "geometry": feature.get("geometry", {})
+            }
+            
             # Update properties with merged data
-            new_feature['properties'] = properties_map[i]
-        output_features.append(new_feature)
-    
-    # Create the output GeoJSON structure
-    output_geojson_data = {
-        "type": geojson_data.get("type", "FeatureCollection"),
-        "features": output_features
-    }
-    
-    # Add any other top-level properties from original GeoJSON
-    for key, value in geojson_data.items():
-        if key not in ["type", "features"]:
-            output_geojson_data[key] = value
-    
-    # Step 6: Convert to JSON string and save as new file
-    output_json_string = json.dumps(output_geojson_data, indent=2)
-    
-    # Create a DataFrame with the JSON string
-    output_df = spark.createDataFrame(
-        [(output_json_string,)], 
-        schema=StructType([StructField("value", StringType(), True)])
-    )
-    
-    # Write the output
-    output_geojson.write_dataframe(output_df)
-
-
-# Alternative implementation if you need to handle very large GeoJSON files more efficiently
-@transform(
-    geojson_input=Input("/path/to/your/geojson/dataset"),
-    table_input=Input("/path/to/your/table/dataset"),
-    output_geojson=Output("/path/to/output/geojson/dataset")
-)
-def merge_geojson_with_table_distributed(geojson_input, table_input, output_geojson):
-    """
-    Alternative implementation for very large GeoJSON files using distributed processing.
-    """
-    
-    spark = geojson_input.spark_session
-    
-    # Read GeoJSON as text
-    geojson_text_df = geojson_input.dataframe()
-    
-    # Parse GeoJSON using Spark's built-in JSON capabilities
-    # This assumes each line is a valid JSON object (for line-delimited GeoJSON)
-    from pyspark.sql.functions import from_json, col, explode
-    from pyspark.sql.types import MapType, StringType, ArrayType
-    
-    # If the GeoJSON is a single document, we need to handle it differently
-    # First, try to parse as a complete document
-    geojson_content = geojson_text_df.select("value").first()[0]
-    geojson_data = json.loads(geojson_content)
-    
-    # Convert features to DataFrame
-    features_rdd = spark.sparkContext.parallelize(geojson_data['features'])
-    
-    def extract_properties_with_geometry(feature):
-        """Extract properties and maintain geometry reference"""
-        properties = feature.get('properties', {})
-        properties['_geometry'] = json.dumps(feature.get('geometry', {}))
-        properties['_type'] = feature.get('type', 'Feature')
-        return properties
-    
-    # Create DataFrame from features
-    properties_rdd = features_rdd.map(extract_properties_with_geometry)
-    geojson_df = spark.createDataFrame(properties_rdd)
-    
-    # Standardize county name
-    geojson_df = geojson_df.withColumn(
-        'COUNTY_NAME_CLEAN',
-        F.upper(F.trim(F.col('COUNTY_NAME')))
-    )
-    
-    # Prepare table dataset
-    table_df = table_input.dataframe()
-    table_df = table_df.withColumn(
-        'county_clean',
-        F.upper(F.trim(F.col('county')))
-    )
-    
-    # Perform merge
-    merged_df = geojson_df.join(
-        table_df,
-        geojson_df.COUNTY_NAME_CLEAN == table_df.county_clean,
-        how='left'
-    )
-    
-    # Reconstruct GeoJSON
-    def reconstruct_feature(row):
-        """Reconstruct GeoJSON feature from row"""
-        row_dict = row.asDict()
+            if i in properties_map:
+                new_feature["properties"] = properties_map[i]
+            else:
+                # Keep original properties if no merge occurred
+                new_feature["properties"] = feature.get("properties", {})
+            
+            # Preserve any other feature attributes
+            for key, value in feature.items():
+                if key not in ["type", "geometry", "properties"]:
+                    new_feature[key] = value
+            
+            output_features.append(new_feature)
         
-        # Extract special fields
-        geometry = json.loads(row_dict.pop('_geometry', '{}'))
-        feature_type = row_dict.pop('_type', 'Feature')
-        
-        # Remove temporary columns
-        row_dict.pop('COUNTY_NAME_CLEAN', None)
-        row_dict.pop('county_clean', None)
-        row_dict.pop('county', None)
-        
-        # Build feature
-        feature = {
-            "type": feature_type,
-            "geometry": geometry,
-            "properties": {k: v for k, v in row_dict.items() if v is not None}
+        # Create the output GeoJSON structure
+        output_geojson_data = {
+            "type": geojson_data.get("type", "FeatureCollection"),
+            "features": output_features
         }
         
-        return feature
+        # Add any other top-level properties from original GeoJSON
+        for key, value in geojson_data.items():
+            if key not in ["type", "features"]:
+                output_geojson_data[key] = value
+        
+        # Step 6: Convert to JSON string and save as new dataset
+        output_json_string = json.dumps(output_geojson_data, indent=2)
+        
+        # Create a DataFrame with the JSON string
+        output_df = spark.createDataFrame(
+            [(output_json_string,)], 
+            schema=StructType([StructField("value", StringType(), True)])
+        )
+        
+        # Write the output
+        output_geojson.write_dataframe(output_df)
+        
+        print(f"Successfully merged GeoJSON with table data. Output contains {len(output_features)} features.")
+        
+    except Exception as e:
+        raise ValueError(f"Error during merge operation: {str(e)}")
+
+
+# Alternative version for raw file inputs (if your GeoJSON is stored as a raw file)
+@transform(
+    geojson_file=FileInput("ri.foundry.main.dataset.your-geojson-file-rid"),  # Raw file
+    table_input=Input("ri.foundry.main.dataset.your-table-rid-here"),
+    output_geojson=Output("ri.foundry.main.dataset.your-output-rid-here")
+)
+def merge_geojson_file_with_table(geojson_file, table_input, output_geojson):
+    """
+    Alternative version that handles GeoJSON stored as a raw file (not a dataset).
+    Use this if your GeoJSON is uploaded as a file rather than imported as a dataset.
+    """
     
-    # Collect and reconstruct features
-    merged_features = merged_df.rdd.map(reconstruct_feature).collect()
+    spark = table_input.spark_session
     
-    # Create output GeoJSON
-    output_geojson_data = {
-        "type": "FeatureCollection",
-        "features": merged_features
-    }
-    
-    # Save as new file
-    output_json_string = json.dumps(output_geojson_data, indent=2)
-    output_df = spark.createDataFrame(
-        [(output_json_string,)],
-        schema=StructType([StructField("value", StringType(), True)])
-    )
-    
-    output_geojson.write_dataframe(output_df)
+    try:
+        # Read the raw GeoJSON file
+        with geojson_file.open('r') as f:
+            geojson_content = f.read()
+        
+        # Parse the GeoJSON
+        geojson_data = json.loads(geojson_content)
+        
+        # Validate structure
+        if 'features' not in geojson_data:
+            if 'type' in geojson_data and geojson_data['type'] == 'Feature':
+                geojson_data = {
+                    "type": "FeatureCollection",
+                    "features": [geojson_data]
+                }
+            else:
+                raise ValueError("Invalid GeoJSON structure")
+        
+        features = geojson_data['features']
+        
+        # Extract properties
+        properties_list = []
+        for i, feature in enumerate(features):
+            properties = feature.get('properties', {})
+            properties['_feature_index'] = i
+            properties_list.append(properties)
+        
+        # Create DataFrame from properties
+        geojson_props_df = spark.createDataFrame(properties_list)
+        
+        # Find county column
+        county_col_geojson = None
+        for col in geojson_props_df.columns:
+            if col.upper() in ['COUNTY_NAME', 'COUNTYNAME', 'COUNTY', 'NAME']:
+                county_col_geojson = col
+                break
+        
+        if not county_col_geojson:
+            raise ValueError(f"No county column found. Columns: {geojson_props_df.columns}")
+        
+        geojson_props_df = geojson_props_df.withColumn(
+            'COUNTY_NAME_CLEAN',
+            F.upper(F.trim(F.col(county_col_geojson)))
+        )
+        
+        # Process table dataset
+        table_df = table_input.dataframe()
+        
+        county_col_table = None
+        for col in table_df.columns:
+            if col.lower() in ['county', 'county_name', 'countyname']:
+                county_col_table = col
+                break
+        
+        if not county_col_table:
+            raise ValueError(f"No county column in table. Columns: {table_df.columns}")
+        
+        table_df = table_df.withColumn(
+            'county_clean',
+            F.upper(F.trim(F.col(county_col_table)))
+        )
+        
+        # Get columns to add from table
+        table_columns = [col for col in table_df.columns 
+                        if col not in [county_col_table, 'county_clean']]
+        
+        # Perform merge
+        merged_df = geojson_props_df.join(
+            table_df,
+            geojson_props_df.COUNTY_NAME_CLEAN == table_df.county_clean,
+            how='left'
+        )
+        
+        # Collect results
+        final_columns = ['_feature_index'] + \
+                       [col for col in geojson_props_df.columns 
+                        if col not in ['COUNTY_NAME_CLEAN', '_feature_index']] + \
+                       table_columns
+        
+        merged_df = merged_df.select(*final_columns)
+        merged_properties = merged_df.collect()
+        
+        # Map properties back
+        properties_map = {}
+        for row in merged_properties:
+            row_dict = row.asDict()
+            idx = row_dict.pop('_feature_index')
+            cleaned = {k: v for k, v in row_dict.items() if v is not None}
+            properties_map[idx] = cleaned
+        
+        # Rebuild features
+        output_features = []
+        for i, feature in enumerate(features):
+            new_feature = {
+                "type": feature.get("type", "Feature"),
+                "geometry": feature.get("geometry", {}),
+                "properties": properties_map.get(i, feature.get("properties", {}))
+            }
+            output_features.append(new_feature)
+        
+        # Create output GeoJSON
+        output_data = {
+            "type": "FeatureCollection",
+            "features": output_features
+        }
+        
+        # Save as dataset
+        output_json = json.dumps(output_data, indent=2)
+        output_df = spark.createDataFrame(
+            [(output_json,)],
+            schema=StructType([StructField("value", StringType(), True)])
+        )
+        
+        output_geojson.write_dataframe(output_df)
+        
+        print(f"Merged {len(output_features)} features successfully")
+        
+    except Exception as e:
+        raise ValueError(f"Error processing merge: {str(e)}")
